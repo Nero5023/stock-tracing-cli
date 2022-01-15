@@ -1,7 +1,13 @@
+use async_std::prelude::*;
+use async_std::stream;
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Clap;
-use std::io::{Error, ErrorKind};
+use futures::future::join_all;
+use std::{
+    io::{Error, ErrorKind},
+    time::Duration,
+};
 use yahoo_finance_api as yahoo;
 
 #[derive(Clap)]
@@ -148,42 +154,57 @@ async fn fetch_closing_data(
     }
 }
 
+async fn process_symbol_data(
+    symbol: &str,
+    beginning: &DateTime<Utc>,
+    end: &DateTime<Utc>,
+) -> Option<Vec<f64>> {
+    let closes = fetch_closing_data(symbol, beginning, end).await.ok()?;
+    if !closes.is_empty() {
+        let max = MaxPrice {};
+        let min = MinPrice {};
+        let price_diff = PriceDifference {};
+        // min/max of the period. unwrap() because those are Option types
+        let period_max: f64 = max.calculate(&closes).await?;
+        let period_min: f64 = min.calculate(&closes).await?;
+        let last_price = *closes.last()?;
+        let (_, pct_change) = price_diff.calculate(&closes).await?;
+        let n_window_sma = WindowedSMA { window_size: 30 };
+        let sma = n_window_sma.calculate(&closes).await?;
+
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            beginning.to_rfc3339(),
+            symbol,
+            last_price,
+            pct_change * 100.0,
+            period_min,
+            period_max,
+            sma.last().unwrap_or(&0.0)
+        );
+    }
+    Some(closes)
+}
+
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
-    let to = Utc::now();
 
-    let max = MaxPrice {};
-    let min = MinPrice {};
-    let price_diff = PriceDifference {};
+    println!("period start,symbol,price,change %,min,max,30d avg");
+    let features = opts.symbols.split(',').into_iter().map(|symbol: &str| {
+        let mut interval = stream::interval(Duration::from_secs(2));
+        async move {
+            while interval.next().await.is_some() {
+                let to = Utc::now();
+                process_symbol_data(symbol, &from, &to).await;
+            }
+        }
+    });
+    join_all(features).await;
 
     // a simple way to output a CSV header
-    println!("period start,symbol,price,change %,min,max,30d avg");
-    for symbol in opts.symbols.split(',') {
-        let closes = fetch_closing_data(symbol, &from, &to).await?;
-        if !closes.is_empty() {
-            // min/max of the period. unwrap() because those are Option types
-            let period_max: f64 = max.calculate(&closes).await.unwrap();
-            let period_min: f64 = min.calculate(&closes).await.unwrap();
-            let last_price = *closes.last().unwrap_or(&0.0);
-            let (_, pct_change) = price_diff.calculate(&closes).await.unwrap_or((0.0, 0.0));
-            let n_window_sma = WindowedSMA { window_size: 30 };
-            let sma = n_window_sma.calculate(&closes).await.unwrap_or_default();
-
-            // a simple way to output CSV data
-            println!(
-                "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
-                from.to_rfc3339(),
-                symbol,
-                last_price,
-                pct_change * 100.0,
-                period_min,
-                period_max,
-                sma.last().unwrap_or(&0.0)
-            );
-        }
-    }
     Ok(())
 }
 
