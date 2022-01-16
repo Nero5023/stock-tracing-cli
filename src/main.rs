@@ -1,17 +1,17 @@
 use async_std::prelude::*;
 use async_std::stream;
+use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Clap;
 use futures::future;
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
 use yahoo_finance_api as yahoo;
-use async_trait::async_trait;
 
 #[derive(Clap)]
 #[clap(
     version = "1.0",
-    author = "Claus Matzinger",
+    author = "Nero Zuo",
     about = "A Manning LiveProject: async Rust"
 )]
 struct Opts {
@@ -26,7 +26,6 @@ struct Opts {
 ///
 #[async_trait]
 trait AsyncStockSignal {
-
     ///
     /// The signal's data type.
     ///
@@ -224,7 +223,9 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some((0.0, 0.0)));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some((-1.0, -1.0)));
         assert_eq!(
-            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
+            signal
+                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
+                .await,
             Some((8.0, 4.0))
         );
         assert_eq!(
@@ -240,7 +241,9 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(0.0));
         assert_eq!(
-            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
+            signal
+                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
+                .await,
             Some(1.0)
         );
         assert_eq!(
@@ -256,7 +259,9 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(1.0));
         assert_eq!(
-            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
+            signal
+                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
+                .await,
             Some(10.0)
         );
         assert_eq!(
