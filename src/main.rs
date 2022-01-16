@@ -6,6 +6,7 @@ use clap::Clap;
 use futures::future;
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
+use xactor::*;
 use yahoo_finance_api as yahoo;
 
 #[derive(Clap)]
@@ -153,6 +154,25 @@ async fn fetch_closing_data(
     }
 }
 
+async fn fetch_quote_data(
+    symbol: &str,
+    beginning: &DateTime<Utc>,
+    end: &DateTime<Utc>,
+) -> Option<Vec<yahoo::Quote>> {
+    let provider = yahoo::YahooConnector::new();
+    let response = provider
+        .get_quote_history(symbol, *beginning, *end)
+        .await
+        .map_err(|_| Error::from(ErrorKind::InvalidData))
+        .ok()?;
+    let mut quotes = response
+        .quotes()
+        .map_err(|_| Error::from(ErrorKind::InvalidData))
+        .ok()?;
+    quotes.sort_by_cached_key(|k| k.timestamp);
+    Some(quotes)
+}
+
 ///
 /// Convenience function that chains together the entire processing chain.
 ///
@@ -190,23 +210,119 @@ async fn handle_symbol_data(
     Some(closes)
 }
 
-#[async_std::main]
+async fn handle_symbol_data_without_featching(closes: Vec<f64>, symbol: &str) -> Option<Vec<f64>> {
+    if !closes.is_empty() {
+        let diff = PriceDifference {};
+        let min = MinPrice {};
+        let max = MaxPrice {};
+        let sma = WindowedSMA { window_size: 30 };
+
+        let period_max: f64 = max.calculate(&closes).await?;
+        let period_min: f64 = min.calculate(&closes).await?;
+
+        let last_price = *closes.last()?;
+        let (_, pct_change) = diff.calculate(&closes).await?;
+        let sma = sma.calculate(&closes).await?;
+
+        // a simple way to output CSV data
+        println!(
+            "{},{},${:.2},{:.2}%,${:.2},${:.2},${:.2}",
+            chrono::Utc::now().to_rfc3339(),
+            symbol,
+            last_price,
+            pct_change * 100.0,
+            period_min,
+            period_max,
+            sma.last().unwrap_or(&0.0)
+        );
+    }
+    Some(closes)
+}
+
+#[message]
+#[derive(Clone, Debug)]
+struct QuoteRequest {
+    symbol: String,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
+
+struct StockDataDownloader;
+
+#[async_trait]
+impl Actor for StockDataDownloader {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<QuoteRequest>().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<QuoteRequest> for StockDataDownloader {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: QuoteRequest) {
+        if let Some(quote) = fetch_quote_data(&msg.symbol, &msg.from, &msg.to).await {
+            Broker::from_registry().await.map(|mut broker| {
+                broker.publish(Quotes {
+                    symbol: msg.symbol.to_owned(),
+                    quotes: quote,
+                })
+            });
+        }
+    }
+}
+
+#[message]
+#[derive(Debug, Default, Clone)]
+struct Quotes {
+    pub symbol: String,
+    pub quotes: Vec<yahoo::Quote>,
+}
+
+struct StockDataProcessor;
+
+#[async_trait]
+impl Actor for StockDataProcessor {
+    async fn started(&mut self, ctx: &mut Context<Self>) -> Result<()> {
+        ctx.subscribe::<Quotes>().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<Quotes> for StockDataProcessor {
+    async fn handle(&mut self, _ctx: &mut Context<Self>, msg: Quotes) {
+        let data: Vec<f64> = msg.quotes.iter().map(|q| q.adjclose as f64).collect();
+        handle_symbol_data_without_featching(data, &msg.symbol).await;
+    }
+}
+
+#[xactor::main]
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
     let to = Utc::now();
 
     let mut interval = stream::interval(Duration::from_secs(30));
+    let _downloader = Supervisor::start(|| StockDataDownloader).await;
+    let _processor = Supervisor::start(|| StockDataProcessor).await;
 
     // a simple way to output a CSV header
     println!("period start,symbol,price,change %,min,max,30d avg");
     let symbols: Vec<&str> = opts.symbols.split(',').collect();
     while let Some(_) = interval.next().await {
-        let queries: Vec<_> = symbols
-            .iter()
-            .map(|&symbol| handle_symbol_data(&symbol, &from, &to))
-            .collect();
-        let _ = future::join_all(queries).await;
+        for symbol in &symbols {
+            let request = QuoteRequest {
+                symbol: symbol.to_string(),
+                from,
+                to,
+            };
+            Broker::from_registry().await.unwrap().publish(request);
+        }
+        //let queries: Vec<_> = symbols
+        //    .iter()
+        //    .map(|&symbol| handle_symbol_data(&symbol, &from, &to))
+        //    .collect();
+        //let _ = future::join_all(queries).await;
     }
     Ok(())
 }
