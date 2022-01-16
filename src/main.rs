@@ -1,19 +1,17 @@
 use async_std::prelude::*;
 use async_std::stream;
-use async_trait::async_trait;
 use chrono::prelude::*;
 use clap::Clap;
-use futures::future::join_all;
-use std::{
-    io::{Error, ErrorKind},
-    time::Duration,
-};
+use futures::future;
+use std::io::{Error, ErrorKind};
+use std::time::Duration;
 use yahoo_finance_api as yahoo;
+use async_trait::async_trait;
 
 #[derive(Clap)]
 #[clap(
     version = "1.0",
-    author = "Nero Zuo",
+    author = "Claus Matzinger",
     about = "A Manning LiveProject: async Rust"
 )]
 struct Opts {
@@ -28,6 +26,7 @@ struct Opts {
 ///
 #[async_trait]
 trait AsyncStockSignal {
+
     ///
     /// The signal's data type.
     ///
@@ -44,16 +43,16 @@ trait AsyncStockSignal {
 }
 
 ///
-/// Calculates the absolute and relative difference between the beginning and ending of an f64 series. The relative difference is relative to the beginning.
-///
-/// # Returns
-///
-/// A tuple `(absolute, relative)` difference.
+/// Calculates the absolute and relative difference between the beginning and ending of an f64 series.
+/// The relative difference is relative to the beginning.
 ///
 struct PriceDifference {}
 
 #[async_trait]
 impl AsyncStockSignal for PriceDifference {
+    ///
+    /// A tuple `(absolute, relative)` to represent a price difference.
+    ///
     type SignalType = (f64, f64);
 
     async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
@@ -74,7 +73,7 @@ impl AsyncStockSignal for PriceDifference {
 /// Window function to create a simple moving average
 ///
 struct WindowedSMA {
-    window_size: usize,
+    pub window_size: usize,
 }
 
 #[async_trait]
@@ -105,15 +104,16 @@ impl AsyncStockSignal for MaxPrice {
     type SignalType = f64;
 
     async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
-        match series {
-            [] => None,
-            _ => Some(series.iter().fold(f64::MIN, |acc, n| acc.max(*n))),
+        if series.is_empty() {
+            None
+        } else {
+            Some(series.iter().fold(f64::MIN, |acc, q| acc.max(*q)))
         }
     }
 }
 
 ///
-/// Find the minimum in a series of f64
+/// Find the maximum in a series of f64
 ///
 struct MinPrice {}
 
@@ -122,9 +122,10 @@ impl AsyncStockSignal for MinPrice {
     type SignalType = f64;
 
     async fn calculate(&self, series: &[f64]) -> Option<Self::SignalType> {
-        match series {
-            [] => None,
-            _ => Some(series.iter().fold(f64::MAX, |acc, n| acc.min(*n))),
+        if series.is_empty() {
+            None
+        } else {
+            Some(series.iter().fold(f64::MAX, |acc, q| acc.min(*q)))
         }
     }
 }
@@ -138,7 +139,6 @@ async fn fetch_closing_data(
     end: &DateTime<Utc>,
 ) -> std::io::Result<Vec<f64>> {
     let provider = yahoo::YahooConnector::new();
-
     let response = provider
         .get_quote_history(symbol, *beginning, *end)
         .await
@@ -154,23 +154,27 @@ async fn fetch_closing_data(
     }
 }
 
-async fn process_symbol_data(
+///
+/// Convenience function that chains together the entire processing chain.
+///
+async fn handle_symbol_data(
     symbol: &str,
     beginning: &DateTime<Utc>,
     end: &DateTime<Utc>,
 ) -> Option<Vec<f64>> {
     let closes = fetch_closing_data(symbol, beginning, end).await.ok()?;
     if !closes.is_empty() {
-        let max = MaxPrice {};
+        let diff = PriceDifference {};
         let min = MinPrice {};
-        let price_diff = PriceDifference {};
-        // min/max of the period. unwrap() because those are Option types
+        let max = MaxPrice {};
+        let sma = WindowedSMA { window_size: 30 };
+
         let period_max: f64 = max.calculate(&closes).await?;
         let period_min: f64 = min.calculate(&closes).await?;
+
         let last_price = *closes.last()?;
-        let (_, pct_change) = price_diff.calculate(&closes).await?;
-        let n_window_sma = WindowedSMA { window_size: 30 };
-        let sma = n_window_sma.calculate(&closes).await?;
+        let (_, pct_change) = diff.calculate(&closes).await?;
+        let sma = sma.calculate(&closes).await?;
 
         // a simple way to output CSV data
         println!(
@@ -191,20 +195,20 @@ async fn process_symbol_data(
 async fn main() -> std::io::Result<()> {
     let opts = Opts::parse();
     let from: DateTime<Utc> = opts.from.parse().expect("Couldn't parse 'from' date");
+    let to = Utc::now();
 
-    println!("period start,symbol,price,change %,min,max,30d avg");
-    let features = opts.symbols.split(',').into_iter().map(|symbol: &str| {
-        let mut interval = stream::interval(Duration::from_secs(2));
-        async move {
-            while interval.next().await.is_some() {
-                let to = Utc::now();
-                process_symbol_data(symbol, &from, &to).await;
-            }
-        }
-    });
-    join_all(features).await;
+    let mut interval = stream::interval(Duration::from_secs(30));
 
     // a simple way to output a CSV header
+    println!("period start,symbol,price,change %,min,max,30d avg");
+    let symbols: Vec<&str> = opts.symbols.split(',').collect();
+    while let Some(_) = interval.next().await {
+        let queries: Vec<_> = symbols
+            .iter()
+            .map(|&symbol| handle_symbol_data(&symbol, &from, &to))
+            .collect();
+        let _ = future::join_all(queries).await;
+    }
     Ok(())
 }
 
@@ -220,9 +224,7 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some((0.0, 0.0)));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some((-1.0, -1.0)));
         assert_eq!(
-            signal
-                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
-                .await,
+            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
             Some((8.0, 4.0))
         );
         assert_eq!(
@@ -238,9 +240,7 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(0.0));
         assert_eq!(
-            signal
-                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
-                .await,
+            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
             Some(1.0)
         );
         assert_eq!(
@@ -256,9 +256,7 @@ mod tests {
         assert_eq!(signal.calculate(&[1.0]).await, Some(1.0));
         assert_eq!(signal.calculate(&[1.0, 0.0]).await, Some(1.0));
         assert_eq!(
-            signal
-                .calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0])
-                .await,
+            signal.calculate(&[2.0, 3.0, 5.0, 6.0, 1.0, 2.0, 10.0]).await,
             Some(10.0)
         );
         assert_eq!(
